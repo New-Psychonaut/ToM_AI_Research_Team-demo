@@ -9,6 +9,7 @@ PY
 script_dir="$(cd "$(dirname "$script_path")" && pwd)"
 stamp="${TOM_RUN_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 
+export TOM_PROJECT_ROOT="${TOM_PROJECT_ROOT:-$script_dir}"
 export TOM_V6_MODAL_APP_NAME="${TOM_V6_MODAL_APP_NAME:-tom-v6-omx-full2-runner-$stamp}"
 export TOM_V6_MODAL_VOLUME_NAME="${TOM_V6_MODAL_VOLUME_NAME:-tom-v6-omx-full2-runs-$stamp}"
 export TOM_V6_WAIT_FOR_RESULTS="${TOM_V6_WAIT_FOR_RESULTS:-1}"
@@ -21,4 +22,3 @@ printf '  app_name: %s\n' "$TOM_V6_MODAL_APP_NAME"
 printf '  volume_name: %s\n' "$TOM_V6_MODAL_VOLUME_NAME"
 
 exec modal run scripts/modal_v6_runner.py "$@"
-

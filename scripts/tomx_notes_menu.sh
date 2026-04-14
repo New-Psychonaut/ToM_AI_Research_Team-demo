@@ -88,22 +88,58 @@ Usage:
   $(basename "$0") --append-note "text"
   $(basename "$0") --show
   $(basename "$0") --open
+  $(basename "$0") --v6-status [volume-name]
+  $(basename "$0") --v5-status [volume-name]
 EOF
+}
+
+show_v6_status() {
+  local status_cmd="$REPO_ROOT/tom-v6-status"
+  local volume_override="${1:-}"
+
+  if [[ ! -x "$status_cmd" ]]; then
+    echo "v6 status command not found or not executable: $status_cmd"
+    return 1
+  fi
+
+  if [[ -n "${volume_override// }" ]]; then
+    "$status_cmd" --volume "$volume_override"
+  else
+    "$status_cmd"
+  fi
+}
+
+show_v5_status() {
+  local status_cmd="$REPO_ROOT/tom-v5-status"
+  local volume_override="${1:-}"
+
+  if [[ ! -x "$status_cmd" ]]; then
+    echo "v5 status command not found or not executable: $status_cmd"
+    return 1
+  fi
+
+  if [[ -n "${volume_override// }" ]]; then
+    "$status_cmd" --volume "$volume_override"
+  else
+    "$status_cmd"
+  fi
 }
 
 main_menu() {
   while true; do
     cat <<'EOF'
 
-📝 ToM Notes Menu
+🧭 ToM Superb Menu
   1) Save current clipboard excerpt
   2) Save current clipboard excerpt (with title)
   3) Write a manual note
   4) Show recent notes
   5) Open notes in VS Code
+  6) Check Modal v6 run status
+  7) Check Modal v5 run status
   0) Exit
 EOF
-    read -r -p "Choose [0-5]: " choice
+    read -r -p "Choose [0-7]: " choice
     case "$choice" in
       1) append_clipboard "Clipboard capture" ;;
       2)
@@ -113,8 +149,16 @@ EOF
       3) append_typed_note ;;
       4) show_recent ;;
       5) open_notes ;;
+      6)
+        read -r -p "Volume override (Enter for default): " volume_override
+        show_v6_status "$volume_override"
+        ;;
+      7)
+        read -r -p "Volume override (Enter for default): " volume_override
+        show_v5_status "$volume_override"
+        ;;
       0) break ;;
-      *) echo "Invalid choice. Pick 0-5." ;;
+      *) echo "Invalid choice. Pick 0-7." ;;
     esac
   done
 }
@@ -145,6 +189,12 @@ case "${1:-}" in
   --open)
     open_notes
     ;;
+  --v6-status)
+    show_v6_status "${2:-}"
+    ;;
+  --v5-status)
+    show_v5_status "${2:-}"
+    ;;
   -h|--help)
     usage
     ;;
@@ -156,4 +206,3 @@ case "${1:-}" in
     exit 1
     ;;
 esac
-

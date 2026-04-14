@@ -6,7 +6,9 @@ import selectors
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 try:
     import modal
@@ -14,7 +16,29 @@ except ImportError as exc:  # pragma: no cover - optional dependency path
     raise RuntimeError("Install Modal first: pip install modal") from exc
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def _resolve_project_root() -> Path:
+    candidates: list[Path] = []
+    env_root = os.environ.get("TOM_PROJECT_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+
+    candidates.append(Path.cwd())
+
+    try:
+        candidates.append(Path(__file__).resolve().parents[1])
+    except Exception:  # pragma: no cover - defensive path handling
+        pass
+
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if (candidate / "train.py").exists() and (candidate / "modal").exists():
+            return candidate
+
+    # Fall back to the script-relative parent when no candidate looks like the repo root.
+    return Path(__file__).resolve().parents[1]
+
+
+PROJECT_ROOT = _resolve_project_root()
 INCUMBENT_FAMILY = os.environ.get("TOM_INCUMBENT_FAMILY", "v6-omx-full2-promo-candidate")
 APP_NAME = os.environ.get("TOM_V6_MODAL_APP_NAME", "tom-v6-omx-full2-runner-20260414")
 DEFAULT_VOLUME_NAME = os.environ.get(
@@ -59,6 +83,7 @@ def _run_streaming_subprocess(
     stdout_log_path: Path,
     stderr_log_path: Path,
     commit_interval_seconds: int,
+    tick_callback: Callable[[], None] | None = None,
 ) -> tuple[int, str, str]:
     proc = subprocess.Popen(
         cmd,
@@ -102,6 +127,12 @@ def _run_streaming_subprocess(
                     stderr_log.flush()
                     print(line, end="", file=sys.stderr)
 
+            if tick_callback is not None:
+                try:
+                    tick_callback()
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    print(f"status_sync_warning={exc}", file=sys.stderr)
+
             if time.monotonic() - last_commit >= commit_interval_seconds:
                 outputs.commit()
                 last_commit = time.monotonic()
@@ -113,21 +144,102 @@ def _run_streaming_subprocess(
 
 
 def _discover_packaged_seeds() -> tuple[int, ...]:
-    seeds: list[int] = []
-    for checkpoint_path in sorted(LOCAL_INCUMBENT_ROOT.glob("seed*/selected_model.pt")):
-        seed_dir = checkpoint_path.parent.name
-        try:
-            seeds.append(int(seed_dir.removeprefix("seed")))
-        except ValueError:
-            continue
+    for incumbent_root in (LOCAL_INCUMBENT_ROOT, REMOTE_INCUMBENT_ROOT):
+        seeds: list[int] = []
+        for checkpoint_path in sorted(incumbent_root.glob("seed*/selected_model.pt")):
+            seed_dir = checkpoint_path.parent.name
+            try:
+                seeds.append(int(seed_dir.removeprefix("seed")))
+            except ValueError:
+                continue
 
-    if not seeds:
-        raise RuntimeError(f"No packaged checkpoints found under {LOCAL_INCUMBENT_ROOT}")
+        if seeds:
+            return tuple(sorted(set(seeds)))
 
-    return tuple(sorted(set(seeds)))
+    raise RuntimeError(
+        "No packaged checkpoints found under "
+        f"{LOCAL_INCUMBENT_ROOT} or {REMOTE_INCUMBENT_ROOT}. "
+        "If running from a non-repo cwd, set TOM_PROJECT_ROOT to the repo root."
+    )
 
 
 AVAILABLE_SEEDS = _discover_packaged_seeds()
+
+
+def _env_or_checkpoint(
+    env_key: str,
+    checkpoint_args: dict[str, object],
+    checkpoint_key: str,
+    default: object,
+) -> str:
+    override = os.environ.get(env_key)
+    if override is not None and override.strip() != "":
+        return override.strip()
+    return str(checkpoint_args.get(checkpoint_key, default))
+
+
+def _as_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_progress_status_fields(
+    progress_payload: dict[str, object],
+    base_train_episodes: int,
+    target_total_episodes: int,
+) -> dict[str, object]:
+    completed_total = _as_int(progress_payload.get("completed_total_episodes"))
+    completed_chunk = _as_int(progress_payload.get("completed_chunk_episodes"))
+    completed_additional = _as_int(progress_payload.get("completed_additional_episodes"))
+    remaining_total = _as_int(progress_payload.get("remaining_total_episodes"))
+
+    if completed_total is None and completed_additional is not None:
+        completed_total = base_train_episodes + completed_additional
+    if completed_total is None and completed_chunk is not None:
+        completed_total = base_train_episodes + completed_chunk
+
+    if completed_additional is None and completed_total is not None:
+        completed_additional = max(0, completed_total - base_train_episodes)
+
+    if remaining_total is None and completed_total is not None:
+        remaining_total = max(0, target_total_episodes - completed_total)
+
+    fields: dict[str, object] = {}
+    if completed_total is not None:
+        fields["completed_total_episodes"] = int(completed_total)
+    if completed_additional is not None:
+        fields["completed_additional_episodes"] = int(completed_additional)
+    if completed_chunk is not None:
+        fields["completed_chunk_episodes"] = int(completed_chunk)
+    if remaining_total is not None:
+        fields["remaining_episodes"] = int(remaining_total)
+
+    for source_key, target_key in (
+        ("latest_checkpoint", "progress_latest_checkpoint"),
+        ("latest_curve", "progress_latest_curve"),
+        ("artifact_episode_tag", "progress_artifact_episode_tag"),
+        ("reported_train_episodes", "progress_reported_train_episodes"),
+        ("is_final", "progress_is_final"),
+    ):
+        if source_key in progress_payload:
+            fields[target_key] = progress_payload[source_key]
+
+    return fields
 
 image = (
     modal.Image.debian_slim()
@@ -231,6 +343,34 @@ def run_v6_seed(
     _write_json(run_status_json, status_payload)
     outputs.commit()
 
+    last_progress_signature: str | None = None
+
+    def _sync_run_status_from_progress(force_commit: bool = False) -> None:
+        nonlocal last_progress_signature
+        progress_payload = _read_json_if_exists(progress_json)
+        if not isinstance(progress_payload, dict):
+            return
+
+        progress_fields = _extract_progress_status_fields(
+            progress_payload=progress_payload,
+            base_train_episodes=start_episodes,
+            target_total_episodes=target_total_episodes,
+        )
+        if not progress_fields:
+            return
+
+        signature = json.dumps(progress_fields, sort_keys=True, default=str)
+        if signature == last_progress_signature:
+            return
+
+        status_payload.update(progress_fields)
+        status_payload["state"] = "running"
+        status_payload["last_progress_sync_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        _write_json(run_status_json, status_payload)
+        last_progress_signature = signature
+        if force_commit:
+            outputs.commit()
+
     cmd = [
         sys.executable,
         "-u",
@@ -264,25 +404,75 @@ def run_v6_seed(
         "--max-steps",
         str(checkpoint_args.get("max_steps", 20)),
         "--tom-experiment",
-        str(checkpoint_args.get("tom_experiment", "contextual_right_of_way_switch")),
+        _env_or_checkpoint(
+            "TOM_RUNNER_TOM_EXPERIMENT",
+            checkpoint_args,
+            "tom_experiment",
+            "contextual_right_of_way_switch",
+        ),
         "--tom-experiment-strength",
-        str(checkpoint_args.get("tom_experiment_strength", 0.25)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_TOM_EXPERIMENT_STRENGTH",
+            checkpoint_args,
+            "tom_experiment_strength",
+            0.25,
+        ),
         "--tom-belief-uncertainty-threshold",
-        str(checkpoint_args.get("tom_belief_uncertainty_threshold", 0.60)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_TOM_BELIEF_UNCERTAINTY_THRESHOLD",
+            checkpoint_args,
+            "tom_belief_uncertainty_threshold",
+            0.60,
+        ),
         "--tom-context-tag-threshold",
-        str(checkpoint_args.get("tom_context_tag_threshold", 0.55)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_TOM_CONTEXT_TAG_THRESHOLD",
+            checkpoint_args,
+            "tom_context_tag_threshold",
+            0.55,
+        ),
         "--tom-proceed-safety-penalty",
-        str(checkpoint_args.get("tom_proceed_safety_penalty", 0.12)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_TOM_PROCEED_SAFETY_PENALTY",
+            checkpoint_args,
+            "tom_proceed_safety_penalty",
+            0.12,
+        ),
         "--tom-conflict-dist-threshold",
-        str(checkpoint_args.get("tom_conflict_dist_threshold", 0.55)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_TOM_CONFLICT_DIST_THRESHOLD",
+            checkpoint_args,
+            "tom_conflict_dist_threshold",
+            0.55,
+        ),
         "--tom-bottleneck-dist-threshold",
-        str(checkpoint_args.get("tom_bottleneck_dist_threshold", 0.45)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_TOM_BOTTLENECK_DIST_THRESHOLD",
+            checkpoint_args,
+            "tom_bottleneck_dist_threshold",
+            0.45,
+        ),
         "--analysis-conflict-dist-threshold",
-        str(checkpoint_args.get("analysis_conflict_dist_threshold", 0.2)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_ANALYSIS_CONFLICT_DIST_THRESHOLD",
+            checkpoint_args,
+            "analysis_conflict_dist_threshold",
+            0.2,
+        ),
         "--analysis-bottleneck-dist-threshold",
-        str(checkpoint_args.get("analysis_bottleneck_dist_threshold", 0.35)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_ANALYSIS_BOTTLENECK_DIST_THRESHOLD",
+            checkpoint_args,
+            "analysis_bottleneck_dist_threshold",
+            0.35,
+        ),
         "--analysis-urgency-threshold",
-        str(checkpoint_args.get("analysis_urgency_threshold", 0.5)),
+        _env_or_checkpoint(
+            "TOM_RUNNER_ANALYSIS_URGENCY_THRESHOLD",
+            checkpoint_args,
+            "analysis_urgency_threshold",
+            0.5,
+        ),
         "--save-dir",
         str(checkpoint_dir),
         "--curve-dir",
@@ -303,7 +493,11 @@ def run_v6_seed(
         stdout_log_path=stdout_log_path,
         stderr_log_path=stderr_log_path,
         commit_interval_seconds=commit_interval_seconds,
+        tick_callback=lambda: _sync_run_status_from_progress(force_commit=True),
     )
+
+    # Final sync in case the last progress write happened right before process exit.
+    _sync_run_status_from_progress(force_commit=True)
 
     saved_checkpoint = _parse_prefixed_line(stdout_text, "saved_checkpoint")
     learning_curve_csv = _parse_prefixed_line(stdout_text, "learning_curve_csv")
@@ -330,6 +524,11 @@ def run_v6_seed(
     }
 
     status_payload["state"] = "completed" if returncode == 0 else "failed"
+    if returncode == 0:
+        status_payload["completed_total_episodes"] = int(target_total_episodes)
+        status_payload["completed_additional_episodes"] = int(max(0, target_total_episodes - start_episodes))
+        status_payload["remaining_episodes"] = 0
+    status_payload["last_status_update_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     _write_json(run_status_json, status_payload)
     _write_json(output_dir / "run_summary.json", summary)
     outputs.commit()
@@ -357,6 +556,10 @@ def main(
     commit_interval_seconds: int = DEFAULT_COMMIT_INTERVAL_SECONDS,
 ) -> None:
     seeds = _parse_seed_csv(seeds_csv)
+    print(f"project_root={PROJECT_ROOT}")
+    print(f"incumbent_family={INCUMBENT_FAMILY}")
+    print(f"local_incumbent_root={LOCAL_INCUMBENT_ROOT}")
+    print(f"available_seeds={AVAILABLE_SEEDS}")
     calls: list[tuple[int, object]] = []
 
     for seed in seeds:
@@ -378,4 +581,3 @@ def main(
     results = modal.FunctionCall.gather(*[function_call for _, function_call in calls])
     for result in results:
         print(json.dumps(result, indent=2, sort_keys=True))
-
